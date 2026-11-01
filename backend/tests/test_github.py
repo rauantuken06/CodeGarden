@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 
 import httpx
 import pytest
@@ -10,6 +11,7 @@ from app.github import (
     GitHubRateLimitError,
     RepositoryNotFoundError,
     get_repository,
+    parse_commit,
 )
 from app.validation import InvalidGitHubURL
 
@@ -197,3 +199,101 @@ def test_invalid_owner_does_not_send_request():
                 transport=transport,
             )
         )
+
+def make_commit_data(date_string):
+    return {
+        "sha": "abc123",
+        "commit": {
+            "message": "fix: correct garden layout",
+            "author": {
+                "date": "2020-01-01T00:00:00Z",
+            },
+            "committer": {
+                "date": date_string,
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("date_string", "expected"),
+    [
+        (
+            "2026-03-01T01:00:00Z",
+            datetime(2026, 3, 1, 1, tzinfo=timezone.utc),
+        ),
+        (
+            "2026-03-01T01:00:00+03:00",
+            datetime(2026, 2, 28, 22, tzinfo=timezone.utc),
+        ),
+        (
+            "2026-03-01T01:00:00-05:00",
+            datetime(2026, 3, 1, 6, tzinfo=timezone.utc),
+        ),
+    ],
+)
+def test_parse_commit_converts_committer_date_to_utc(
+    date_string,
+    expected,
+):
+    result = parse_commit(make_commit_data(date_string))
+
+    assert result.sha == "abc123"
+    assert result.message == "fix: correct garden layout"
+    assert result.committed_at == expected
+    assert result.committed_at.tzinfo is timezone.utc
+
+
+@pytest.mark.parametrize(
+    "date_string",
+    [
+        "not-a-date",
+        "2026-03-01T01:00:00",
+        "",
+        None,
+    ],
+)
+def test_parse_commit_rejects_invalid_date(date_string):
+    with pytest.raises(GitHubAPIError):
+        parse_commit(make_commit_data(date_string))
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {},
+        {"sha": "abc123"},
+        {"sha": "abc123", "commit": None},
+        {
+            "sha": "abc123",
+            "commit": {
+                "message": "fix: example",
+                "committer": {},
+            },
+        },
+    ],
+)
+def test_parse_commit_rejects_missing_fields(data):
+    with pytest.raises(GitHubAPIError):
+        parse_commit(data)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("sha", ""),
+        ("sha", None),
+        ("message", None),
+        ("message", 123),
+    ],
+)
+def test_parse_commit_rejects_invalid_fields(field, value):
+    data = make_commit_data("2026-03-01T01:00:00Z")
+
+    if field == "sha":
+        data["sha"] = value
+    else:
+        data["commit"]["message"] = value
+
+    with pytest.raises(GitHubAPIError):
+        parse_commit(data)
