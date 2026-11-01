@@ -34,7 +34,7 @@ def check_response(response: httpx.Response) -> None:
             status == 429
             or response.headers.get("x-ratelimit-remaining") == "0"
             or "retry-after" in response.headers
-            or "rate-limit" in response.text.lower()
+            or "rate limit" in response.text.lower()
         )
 
         if is_rate_limit:
@@ -61,7 +61,7 @@ async def get_repository(
     owner: str,
     repo: str,
     *,
-    trnasport: httpx.AsyncBaseTransport | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
 ) -> dict:
     """Получает метаданные публичного GitHub-репозитория."""
     validate_repository_parts(owner, repo)
@@ -82,7 +82,7 @@ async def get_repository(
             base_url="https://api.github.com",
             headers=headers,
             timeout=15.0,
-            transport=trnasport,
+            transport=transport,
             follow_redirects=False,
         ) as client:
             response = await client.get(f"/repos/{owner}/{repo}")
