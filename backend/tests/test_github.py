@@ -12,6 +12,7 @@ from app.github import (
     RepositoryNotFoundError,
     get_repository,
     parse_commit,
+    get_commits
 )
 from app.validation import InvalidGitHubURL
 
@@ -297,3 +298,216 @@ def test_parse_commit_rejects_invalid_fields(field, value):
 
     with pytest.raises(GitHubAPIError):
         parse_commit(data)
+
+def fetch_commits_with_handler(handler):
+    return asyncio.run(
+        get_commits(
+            "psf",
+            "requests",
+            transport=httpx.MockTransport(handler),
+        )
+    )
+
+def make_commit_page(start, count):
+    items = []
+
+    for number in range(start, start + count):
+        item = make_commit_data("2026-03-01T01:00:00Z")
+        item["sha"] = f"{number:040x}"
+        items.append(item)
+
+    return items
+
+def next_page_headers(page):
+    url = (
+        "https://api.github.com/repos/psf/requests/commits"
+        f"?per_page=100&page={page}"
+    )
+
+    return {"Link": f'<{url}>; rel="next"'}
+
+@pytest.mark.parametrize(
+    ("page_sizes", "more_after_last", "expected_truncated"),
+    [
+        ([3], False, False),
+        ([100], False, False),
+        ([100, 50], False, False),
+        ([100, 100, 100], True, True),
+        ([100, 100, 100], False, False),
+        ([0], False, False),
+        ([2, 1], False, False),
+    ],
+)
+def test_commit_pagination(
+    page_sizes,
+    more_after_last,
+    expected_truncated,
+):
+    requested_pages = []
+
+    def handler(request):
+        assert request.method == "GET"
+        assert request.url.path == "/repos/psf/requests/commits"
+        assert request.url.params["per_page"] == "100"
+
+        page = int(request.url.params["page"])
+        requested_pages.append(page)
+
+        assert page <= len(page_sizes)
+
+        start = sum(page_sizes[:page - 1])
+        count = page_sizes[page - 1]
+
+        has_next = page < len(page_sizes) or more_after_last
+        headers = next_page_headers(page + 1) if has_next else {}
+
+        return httpx.Response(
+            200,
+            json=make_commit_page(start, count),
+            headers=headers,
+        )
+
+    result = fetch_commits_with_handler(handler)
+
+    assert len(result.commits) == sum(page_sizes)
+    assert result.truncated is expected_truncated
+    assert requested_pages == list(range(1, len(page_sizes) + 1))
+    assert all(
+        commit.committed_at.tzinfo is timezone.utc
+        for commit in result.commits
+    )
+
+def test_confirmed_empty_repository():
+    def handler(request):
+        return httpx.Response(
+            409,
+            json={"message": "Git Repository is empty."},
+        )
+
+    result = fetch_commits_with_handler(handler)
+
+    assert result.commits == []
+    assert result.truncated is False
+
+def test_other_conflict_is_an_error():
+    def handler(request):
+        return httpx.Response(
+            409,
+            json={"message": "Another conflict"},
+        )
+
+    with pytest.raises(GitHubAPIError):
+        fetch_commits_with_handler(handler)
+
+@pytest.mark.parametrize("status", [403, 429])
+def test_commit_rate_limit(status):
+    def handler(request):
+        return httpx.Response(
+            status,
+            json={"message": "API rate limit exceeded"},
+            headers={"x-ratelimit-remaining": "0"},
+        )
+
+    with pytest.raises(GitHubRateLimitError):
+        fetch_commits_with_handler(handler)
+
+@pytest.mark.parametrize("status", [403, 429, 500, 409])
+def test_second_page_error_does_not_return_partial_history(status):
+    requested_pages = []
+
+    def handler(request):
+        page = int(request.url.params["page"])
+        requested_pages.append(page)
+
+        if page == 1:
+            return httpx.Response(
+                200,
+                json=make_commit_page(0, 100),
+                headers=next_page_headers(2),
+            )
+
+        message = (
+            "Git Repository is empty."
+            if status == 409
+            else "Request failed"
+        )
+
+        return httpx.Response(
+            status,
+            json={"message": message},
+        )
+
+    with pytest.raises(GitHubAPIError):
+        fetch_commits_with_handler(handler)
+
+    assert requested_pages == [1, 2]
+
+def test_second_page_network_error():
+    def handler(request):
+        page = int(request.url.params["page"])
+
+        if page == 1:
+            return httpx.Response(
+                200,
+                json=make_commit_page(0, 100),
+                headers=next_page_headers(2),
+            )
+
+        raise httpx.ReadTimeout("Timed out", request=request)
+
+    with pytest.raises(GitHubNetworkError):
+        fetch_commits_with_handler(handler)
+
+def test_duplicate_sha_is_an_error():
+    def handler(request):
+        page = int(request.url.params["page"])
+
+        if page == 1:
+            return httpx.Response(
+                200,
+                json=make_commit_page(0, 100),
+                headers=next_page_headers(2),
+            )
+
+        # SHA последнего коммита первой страницы повторяется.
+        return httpx.Response(
+            200,
+            json=make_commit_page(99, 2),
+        )
+
+    with pytest.raises(GitHubAPIError, match="повторяющийся"):
+        fetch_commits_with_handler(handler)
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"message": "Unexpected object"},
+        [None],
+        [{}],
+    ],
+)
+
+def test_invalid_commit_page(body):
+    def handler(request):
+        return httpx.Response(200, json=body)
+
+    with pytest.raises(GitHubAPIError):
+        fetch_commits_with_handler(handler)
+
+def test_invalid_commit_page_json():
+    def handler(request):
+        return httpx.Response(200, content=b"not json")
+
+    with pytest.raises(GitHubAPIError):
+        fetch_commits_with_handler(handler)
+
+def test_empty_page_with_next_is_an_error():
+    def handler(request):
+        return httpx.Response(
+            200,
+            json=[],
+            headers=next_page_headers(2),
+        )
+
+    with pytest.raises(GitHubAPIError):
+        fetch_commits_with_handler(handler)
