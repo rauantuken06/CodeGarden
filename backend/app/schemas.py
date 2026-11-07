@@ -29,3 +29,15 @@ class GardenData(BaseModel):
     plants: list[Plant]
     flowers: list[Flower]
 
+class RepositoryMetadata(BaseModel):
+    owner: str
+    name: str
+    full_name: str
+    description: str | None
+    stars: int
+    html_url: str
+    default_branch: str
+
+class GardenResponse(BaseModel):
+    repository: RepositoryMetadata
+    garden: GardenData
