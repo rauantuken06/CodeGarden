@@ -84,6 +84,12 @@ async def get_garden(owner: str, repo: str) -> GardenResponse:
 
     except GitHubRateLimitError as error:
         raise HTTPException(
+            status_code=429,
+            detail="Превышен лимит запросов GitHub. Попробуйте позже.",
+        ) from error
+
+    except GitHubNetworkError as error:
+        raise HTTPException(
             status_code=503,
             detail="Не удалось связаться с GitHub. Попробуйте позже.",
         ) from error
